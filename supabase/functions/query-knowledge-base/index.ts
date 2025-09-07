@@ -5,6 +5,11 @@ import { corsHeaders } from '../_shared/cors.ts';
 const supabaseUrl = Deno.env.get('SUPABASE_URL')!;
 const supabaseServiceKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!;
 
+// Configuration with defaults
+const DEFAULT_SIMILARITY_THRESHOLD = parseFloat(Deno.env.get('SIMILARITY_THRESHOLD') || '0.6');
+const DEFAULT_MAX_CHUNKS = parseInt(Deno.env.get('MAX_CHUNKS') || '50');
+const DEFAULT_RRF_K_VALUE = parseInt(Deno.env.get('RRF_K_VALUE') || '10');
+
 if (!supabaseUrl || !supabaseServiceKey) {
   throw new Error('Missing required environment variables: SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY');
 }
@@ -26,7 +31,9 @@ interface SearchRequest {
   limit?: number;
   min_similarity?: number;
   include_public_only?: boolean;
-  debug?: boolean; // Add debug flag for detailed scoring
+  debug?: boolean; // Enable detailed scoring information
+  enable_fallback?: boolean; // Default to true - enables resilient multi-pass search
+  enable_density_calc?: boolean; // Default to true - enables relevance density calculation
 }
 
 Deno.serve(async (req: Request) => {
@@ -100,7 +107,7 @@ Deno.serve(async (req: Request) => {
       );
     }
 
-    console.log(`[query-knowledge-base] Processing query: "${body.user_query}" for user ${user?.id}`);
+    console.log(`[query-knowledge-base] Processing query: "${body.user_query}"`);
 
     // Performance timing - declare at the very beginning
     const performanceMetrics = {
@@ -148,8 +155,8 @@ Deno.serve(async (req: Request) => {
     }
 
     // Set default values
-    const limit = body.limit || 50; // Increased from 20 to 50 for better RRF scoring and relevance density
-    const minSimilarity = body.min_similarity || 0.6; // Better default threshold for balanced results
+    const limit = body.limit || DEFAULT_MAX_CHUNKS; // Configurable chunk limit for search results
+    const minSimilarity = body.min_similarity || DEFAULT_SIMILARITY_THRESHOLD; // Configurable similarity threshold
     const includePublicOnly = body.include_public_only || false;
 
     // Always pass the user ID as p_user_id to include private docs for the user
@@ -250,7 +257,7 @@ Deno.serve(async (req: Request) => {
     
     // Process semantic results (similarity_score)
     semanticResults.forEach((result: any, index: number) => {
-      const rrfScore = 1 / (10 + index); // RRF formula - improved k=10 for better differentiation
+      const rrfScore = 1 / (DEFAULT_RRF_K_VALUE + index); // RRF formula with configurable k value
       console.log(`[query-knowledge-base] Semantic result ${index + 1}: RRF = ${rrfScore}, similarity = ${result.similarity_score}`);
       resultMap.set(result.id, {
         ...result,
@@ -265,7 +272,7 @@ Deno.serve(async (req: Request) => {
     
     // Process keyword results (relevance_score)
     keywordResults.forEach((result: any, index: number) => {
-      const rrfScore = 1 / (10 + index); // RRF formula - improved k=10 for better differentiation
+      const rrfScore = 1 / (DEFAULT_RRF_K_VALUE + index); // RRF formula with configurable k value
       if (resultMap.has(result.id)) {
         // Combine scores for existing results
         const existing = resultMap.get(result.id);
@@ -338,11 +345,12 @@ Deno.serve(async (req: Request) => {
       }
     }
 
-    // PHASE 1: Simple Fallback Strategy
+    // PHASE 1: Configurable Fallback Strategy (Production-Grade Resilience)
     // If precision pass returns too few results, try broader search
     const MIN_RESULTS_THRESHOLD = 3; // Trigger fallback if less than 3 results
+    const enableFallback = body.enable_fallback !== false; // Default to true
     
-    if (filteredResults.length < MIN_RESULTS_THRESHOLD && !fallbackUsed) {
+    if (enableFallback && filteredResults.length < MIN_RESULTS_THRESHOLD && !fallbackUsed) {
       console.log(`[query-knowledge-base] Precision pass returned ${filteredResults.length} results (below threshold ${MIN_RESULTS_THRESHOLD}), trying broader search...`);
       
       try {
@@ -372,7 +380,7 @@ Deno.serve(async (req: Request) => {
           const broaderResultMap = new Map();
           
           broaderSemantic.forEach((result: any, index: number) => {
-            const rrfScore = 1 / (10 + index); // RRF formula - improved k=10 for better differentiation
+            const rrfScore = 1 / (DEFAULT_RRF_K_VALUE + index); // RRF formula with configurable k value
             broaderResultMap.set(result.id, {
               ...result,
               similarity: result.similarity_score,
@@ -385,7 +393,7 @@ Deno.serve(async (req: Request) => {
           });
           
           broaderKeyword.forEach((result: any, index: number) => {
-            const rrfScore = 1 / (10 + index); // RRF formula - improved k=10 for better differentiation
+            const rrfScore = 1 / (DEFAULT_RRF_K_VALUE + index); // RRF formula with configurable k value
             if (broaderResultMap.has(result.id)) {
               const existing = broaderResultMap.get(result.id);
               existing.rrf_score += rrfScore;
@@ -489,7 +497,11 @@ Deno.serve(async (req: Request) => {
       }
     });
     
-          // Calculate relevance density for each document
+    // Configurable Relevance Density Calculation (Production-Grade Quality Metrics)
+    const enableDensityCalc = body.enable_density_calc !== false; // Default to true
+    
+    if (enableDensityCalc) {
+      // Calculate relevance density for each document
       documentMap.forEach((docEntry) => {
         // Get the number of chunks returned by the search for this document
         const matchedChunks = docEntry.chunks.length;
@@ -514,6 +526,12 @@ Deno.serve(async (req: Request) => {
 
         console.log(`[query-knowledge-base] Document "${docEntry.document_title}": Found ${matchedChunks} relevant chunks out of ${totalChunksInDocument} total. Density: ${(docEntry.relevance_density * 100).toFixed(0)}%`);
       });
+    } else {
+      // Initialize density to 0 if calculation is disabled
+      documentMap.forEach((docEntry) => {
+        docEntry.relevance_density = 0;
+      });
+    }
     
     // Convert map to array and sort by best RRF score
     const groupedResults = Array.from(documentMap.values())

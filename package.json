@@ -1,75 +1,45 @@
 {
   "name": "rag-insights-engine",
   "version": "1.0.0",
-  "description": "A production-ready RAG (Retrieval-Augmented Generation) system that transforms document embeddings into intelligent insights through multi-stage LLM processing and hybrid search",
+  "description": "Advanced RAG Insights Engine with Hybrid Search - A production-ready system for generating intelligent insights from document collections",
   "main": "index.js",
-  "type": "module",
   "scripts": {
-    "setup": "node src/scripts/setup-system.js",
-    "test": "npm run test:integration && npm run test:performance",
-    "test:integration": "vitest run tests/integration",
-    "test:performance": "vitest run tests/performance",
-    "test:watch": "vitest tests/integration",
-    "seed": "node src/scripts/seed-sample-data.js",
-    "smoke": "node src/scripts/run-example.js",
-    "migrate": "supabase db push",
-    "functions:deploy": "supabase functions deploy",
-    "dev": "supabase start",
-    "logs": "supabase functions logs",
-    "help": "node src/scripts/show-help.js"
+    "bootstrap": "psql $DATABASE_URL -f supabase/bootstrap.sql",
+    "test": "node scripts/test-rag-engine.cjs",
+    "test:performance": "node scripts/test-performance.cjs",
+    "test:quality": "node scripts/test-search-quality.cjs",
+    "smoke-test": "npm run test && echo '✅ All tests passed - RAG Engine is ready!'",
+    "deploy": "supabase functions deploy",
+    "dev": "supabase functions serve"
   },
   "keywords": [
     "rag",
     "retrieval-augmented-generation",
-    "vector-search",
     "hybrid-search",
-    "llm",
-    "ai",
-    "document-search",
+    "vector-search",
     "semantic-search",
+    "llm",
+    "openai",
     "supabase",
-    "edge-functions",
     "pgvector"
   ],
-  "author": {
-    "name": "Your Name",
-    "email": "your-email@example.com",
-    "url": "https://linkedin.com/in/your-profile"
-  },
+  "author": "RAG Insights Engine Team",
   "license": "MIT",
-  "repository": {
-    "type": "git",
-    "url": "https://github.com/yourusername/rag-insights-engine.git"
+  "dependencies": {
+    "@supabase/supabase-js": "^2.39.0"
   },
-  "bugs": {
-    "url": "https://github.com/yourusername/rag-insights-engine/issues"
+  "devDependencies": {
+    "dotenv": "^16.3.1"
   },
-  "homepage": "https://github.com/yourusername/rag-insights-engine#readme",
   "engines": {
     "node": ">=18.0.0"
   },
-  "dependencies": {
-    "@supabase/supabase-js": "^2.38.0",
-    "openai": "^4.20.0",
-    "dotenv": "^16.3.1"
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/your-org/rag-insights-engine.git"
   },
-  "devDependencies": {
-    "@types/node": "^20.0.0",
-    "typescript": "^5.0.0",
-    "vitest": "^1.0.0",
-    "supabase": "^1.100.0",
-    "@typescript-eslint/eslint-plugin": "^6.0.0",
-    "@typescript-eslint/parser": "^6.0.0",
-    "eslint": "^8.0.0",
-    "prettier": "^3.0.0"
+  "bugs": {
+    "url": "https://github.com/your-org/rag-insights-engine/issues"
   },
-  "files": [
-    "src/",
-    "docs/",
-    "config/",
-    "examples/",
-    "README.md",
-    "LICENSE",
-    "CONTRIBUTING.md"
-  ]
+  "homepage": "https://github.com/your-org/rag-insights-engine#readme"
 }

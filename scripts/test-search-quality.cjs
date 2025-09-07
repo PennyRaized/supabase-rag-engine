@@ -11,11 +11,13 @@ const { createClient } = require('@supabase/supabase-js');
 require('dotenv').config();
 
 // Configuration
-const SUPABASE_URL = process.env.SUPABASE_URL;
-const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY;
+const SUPABASE_URL = process.env.VITE_SUPABASE_URL || process.env.SUPABASE_URL;
+const SUPABASE_ANON_KEY = process.env.VITE_SUPABASE_ANON_KEY || process.env.SUPABASE_ANON_KEY;
 
 if (!SUPABASE_URL || !SUPABASE_ANON_KEY) {
   console.error('❌ Missing required environment variables: SUPABASE_URL or SUPABASE_ANON_KEY');
+  console.error('💡 Make sure you have a .env file with the required variables');
+  console.error('💡 Copy .env.example to .env and fill in your values');
   process.exit(1);
 }
 

@@ -554,7 +554,7 @@ Deno.serve(async (req: Request) => {
     }
 
     console.log(`[generate-rag-insights] Processing ${body.insight_type} for query: "${body.user_query}" with ${body.documents.length} documents`);
-    console.log(`[generate-rag-insights] Priority processing requested: ${body.priority} (type: ${typeof body.priority})`);
+    console.log(`[generate-rag-insights] Priority processing requested: ${body.priority}`);
 
     // Generate cache key
     const cacheKey = body.cache_key || generateCacheKey(body.user_query, body.documents, body.insight_type);
