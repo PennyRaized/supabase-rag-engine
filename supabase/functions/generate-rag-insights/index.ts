@@ -29,6 +29,8 @@ interface InsightRequest {
     similarity_score?: number; // Similarity score from search results
   }>;
   insight_type: 'document_summaries' | 'key_questions' | 'direct_answer' | 'related_questions' | 'all';
+  cache_key?: string; // For caching optimization
+  priority?: boolean; // Enable OpenAI priority processing
   search_time_ms?: number; // Actual search time from query-knowledge-base
 }
 
@@ -58,11 +60,20 @@ interface InsightResponse {
   document_summaries?: DocumentSummary[];
   direct_answer?: DirectAnswer;
   related_questions?: RelatedQuestion[];
+  cache_key: string;
   generated_at: string;
 }
 
-// Helper function to get OpenAI chat completion with timeout
-async function getOpenAIChatCompletion(messages: any[], model = 'gpt-4o-mini', temperature = 0.3) {
+// Generate cache key for insights
+function generateCacheKey(query: string, documents: any[], insightType: string): string {
+  const docIds = documents.map(d => d.document_id).sort().join(',');
+  const queryHash = btoa(query).replace(/[^a-zA-Z0-9]/g, '');
+  return `${insightType}_${queryHash}_${docIds}`;
+}
+
+// Helper function to get OpenAI chat completion with timeout (following query-enhancer pattern)
+// Using gpt-4o-mini for optimal speed/latency balance
+async function getOpenAIChatCompletion(messages: any[], model = 'gpt-4o-mini', temperature = 0.3, priority = false) {
   const OPENAI_API_KEY = Deno.env.get('OPENAI_API_KEY');
   if (!OPENAI_API_KEY) {
     throw new Error('OpenAI API key not configured');
@@ -78,8 +89,11 @@ async function getOpenAIChatCompletion(messages: any[], model = 'gpt-4o-mini', t
       messages,
       temperature,
       response_format: { type: "json_object" },
-      max_tokens: 1000
+      max_tokens: 1000,
+      ...(priority && { service_tier: "priority" })
     };
+    
+    console.log(`[getOpenAIChatCompletion] Sending request with priority: ${priority}, service_tier: ${priority ? 'priority' : 'undefined'}`);
     
     const response = await fetch('https://api.openai.com/v1/chat/completions', {
       method: 'POST',
@@ -116,7 +130,8 @@ async function getOpenAIChatCompletion(messages: any[], model = 'gpt-4o-mini', t
 // Generate a single concise relevance sentence per document
 async function generateDocumentSummaries(
   documents: any[],
-  userQuery: string
+  userQuery: string,
+  priority: boolean = false
 ): Promise<DocumentSummary[]> {
   const tasks = documents.map(async (doc: any) => {
     try {
@@ -159,7 +174,7 @@ JSON OUTPUT EXAMPLE:
 IMPORTANT: Your confidence score should reflect how well the document content addresses the user's query.`;
 
       const messages = [{ role: 'user', content: prompt }];
-      const llmResponse = await getOpenAIChatCompletion(messages, 'gpt-4o-mini', 0.2);
+      const llmResponse = await getOpenAIChatCompletion(messages, 'gpt-4o-mini', 0.2, priority);
       let relevance_summary = '';
       let confidence_score = 0.8;
       try {
@@ -195,7 +210,8 @@ IMPORTANT: Your confidence score should reflect how well the document content ad
 // Generate direct answer from multiple documents
 async function generateDirectAnswer(
   documents: any[], 
-  userQuery: string
+  userQuery: string,
+  priority: boolean = false
 ): Promise<DirectAnswer> {
   try {
     const topChunks = documents
@@ -242,7 +258,7 @@ Format the response as JSON:
       }
     ];
 
-    const llmResponse = await getOpenAIChatCompletion(messages, 'gpt-4o-mini', 0.3);
+    const llmResponse = await getOpenAIChatCompletion(messages, 'gpt-4o-mini', 0.3, priority);
 
     try {
       const parsed = JSON.parse(llmResponse);
@@ -294,7 +310,8 @@ Format the response as JSON:
 // Generate related questions based on direct answer or fallback context
 async function generateRelatedQuestions(
   context: string, 
-  userQuery: string
+  userQuery: string,
+  priority: boolean = false
 ): Promise<RelatedQuestion[]> {
   console.log(`[generateRelatedQuestions] Starting with context length: ${context.length}, userQuery: "${userQuery}"`);
   try {
@@ -356,7 +373,7 @@ JSON OUTPUT:`;
       }
     ];
 
-    const llmResponse = await getOpenAIChatCompletion(messages, 'gpt-4o-mini', 0.3);
+    const llmResponse = await getOpenAIChatCompletion(messages, 'gpt-4o-mini', 0.3, priority);
     
     console.log(`[generateRelatedQuestions] Raw LLM response:`, llmResponse);
     console.log(`[generateRelatedQuestions] Response length:`, llmResponse.length);
@@ -395,6 +412,46 @@ JSON OUTPUT:`;
     
     console.log(`[generateRelatedQuestions] Function completed successfully`);
   }
+
+// Check cache for existing insights
+async function checkCache(cacheKey: string): Promise<any | null> {
+  try {
+    const { data, error } = await supabase
+      .from('insight_cache')
+      .select('insights_data')
+      .eq('cache_key', cacheKey)
+      .gt('expires_at', new Date().toISOString())
+      .single();
+    
+    if (error || !data) return null;
+    return data.insights_data;
+  } catch (error) {
+    console.error('Cache check error:', error);
+    return null;
+  }
+}
+
+// Store insights in cache
+async function storeInCache(cacheKey: string, insights: any): Promise<void> {
+  try {
+    const expiresAt = new Date();
+    expiresAt.setHours(expiresAt.getHours() + 24); // 24-hour TTL
+    
+    const { error } = await supabase
+      .from('insight_cache')
+      .upsert({
+        cache_key: cacheKey,
+        insights_data: insights,
+        expires_at: expiresAt.toISOString()
+      });
+    
+    if (error) {
+      console.error('Cache storage error:', error);
+    }
+  } catch (error) {
+    console.error('Cache storage error:', error);
+  }
+}
 
 Deno.serve(async (req: Request) => {
   const startTime = Date.now();
@@ -470,6 +527,38 @@ Deno.serve(async (req: Request) => {
     }
 
     console.log(`[generate-rag-insights] Processing ${body.insight_type} for query: "${body.user_query}" with ${body.documents.length} documents`);
+    console.log(`[generate-rag-insights] Priority processing requested: ${body.priority} (type: ${typeof body.priority})`);
+
+    // Generate cache key
+    const cacheKey = body.cache_key || generateCacheKey(body.user_query, body.documents, body.insight_type);
+    
+    // Check cache first
+    const cacheStartTime = Date.now();
+    const cachedInsights = await checkCache(cacheKey);
+    const cacheDuration = Date.now() - cacheStartTime;
+    
+    if (cachedInsights) {
+      console.log(`[generate-rag-insights] Cache hit for key: ${cacheKey} (${cacheDuration}ms)`);
+      const totalDuration = Date.now() - startTime;
+      return new Response(
+        JSON.stringify({
+          ...cachedInsights,
+          cache_key: cacheKey,
+          cached: true,
+          performance_metrics: {
+            total_duration_ms: totalDuration,
+            cache_lookup_ms: cacheDuration,
+            insights_generation_ms: 0, // Cached, no generation needed
+            llm_calls_ms: 0
+          }
+        }),
+        {
+          headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+        }
+      );
+    }
+    
+    console.log(`[generate-rag-insights] Cache miss, generating insights (${cacheDuration}ms)`);
 
     // Generate insights based on type with individual timing
     const insights: any = {};
@@ -481,12 +570,12 @@ Deno.serve(async (req: Request) => {
     
     if (body.insight_type === 'document_summaries' || body.insight_type === 'all') {
       (timingData as any).document_summaries = { startTime: Date.now() };
-      insightPromises.document_summaries = generateDocumentSummaries(body.documents, body.user_query);
+      insightPromises.document_summaries = generateDocumentSummaries(body.documents, body.user_query, body.priority);
     }
     
     if (body.insight_type === 'direct_answer' || body.insight_type === 'all') {
       timingData.direct_answer = { startTime: Date.now() };
-      insightPromises.direct_answer = generateDirectAnswer(body.documents, body.user_query);
+      insightPromises.direct_answer = generateDirectAnswer(body.documents, body.user_query, body.priority);
     }
     
     if (body.insight_type === 'related_questions' || body.insight_type === 'all') {
@@ -502,7 +591,7 @@ Deno.serve(async (req: Request) => {
       console.log(`[generate-rag-insights] Using fallback context for related questions (${fallbackContext.length} chars)`);
       console.log(`[generate-rag-insights] Fallback context preview: ${fallbackContext.substring(0, 200)}...`);
       
-      insightPromises.related_questions = generateRelatedQuestions(fallbackContext, body.user_query);
+      insightPromises.related_questions = generateRelatedQuestions(fallbackContext, body.user_query, body.priority);
     }
     
     // Wait for all insights to complete in parallel
@@ -528,6 +617,9 @@ Deno.serve(async (req: Request) => {
     
     console.log(`[generate-rag-insights] All insights generated in parallel in ${Date.now() - llmStartTime}ms`);
 
+    // Store in cache
+    await storeInCache(cacheKey, insights);
+
     // Store search history if user is authenticated
     if (user?.id) {
       try {
@@ -551,12 +643,15 @@ Deno.serve(async (req: Request) => {
     
     const response: InsightResponse = {
       ...insights,
+      cache_key: cacheKey,
       generated_at: new Date().toISOString(),
       performance_metrics: {
         total_duration_ms: totalDuration + (body.search_time_ms || 0), // Include semantic search time for end-to-end duration
+        cache_lookup_ms: cacheDuration,
         semantic_search_ms: body.search_time_ms || 0, // Use actual search time from query-knowledge-base
         insights_generation_ms: llmDuration,
         llm_calls_ms: llmDuration,
+        priority_processing: body.priority || false,
         breakdown: {
           document_summaries_ms: (timingData as any).document_summaries?.duration || 0,
           direct_answer_ms: timingData.direct_answer?.duration || 0,

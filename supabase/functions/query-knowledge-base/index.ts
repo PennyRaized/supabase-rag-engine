@@ -29,6 +29,8 @@ interface SearchRequest {
 }
 
 Deno.serve(async (req: Request) => {
+  const startTime = Date.now();
+  
   // Handle CORS preflight
   if (req.method === 'OPTIONS') {
     return new Response('ok', { headers: corsHeaders });
@@ -101,8 +103,19 @@ Deno.serve(async (req: Request) => {
 
     console.log(`[query-knowledge-base] Processing query: "${body.user_query}" for user ${user?.id}`);
 
+    // Performance timing - declare at the very beginning
+    const performanceMetrics = {
+      embedding_generation_ms: 0,
+      semantic_search_ms: 0,
+      keyword_search_ms: 0,
+      rrf_fusion_ms: 0,
+      document_grouping_ms: 0,
+      total_search_ms: 0
+    };
+
     // Generate embedding for the query
     let queryEmbedding: number[];
+    const embeddingStartTime = Date.now();
     
     try {
       // @ts-ignore: Supabase AI embedding call for Deno Edge Functions
@@ -118,7 +131,8 @@ Deno.serve(async (req: Request) => {
       }
       
       queryEmbedding = embeddingResult;
-      console.log(`[query-knowledge-base] Generated embedding for query (${queryEmbedding.length} dimensions)`);
+      performanceMetrics.embedding_generation_ms = Date.now() - embeddingStartTime;
+      console.log(`[query-knowledge-base] Generated embedding for query (${queryEmbedding.length} dimensions) in ${performanceMetrics.embedding_generation_ms}ms`);
       
     } catch (embeddingError: any) {
       console.error('[query-knowledge-base] Error generating query embedding:', embeddingError);
@@ -135,57 +149,74 @@ Deno.serve(async (req: Request) => {
     }
 
     // Set default values
-    const limit = body.limit || 50;
-    const minSimilarity = body.min_similarity || 0.6;
+    const limit = body.limit || 50; // Increased from 20 to 50 for better RRF scoring and relevance density
+    const minSimilarity = body.min_similarity || 0.6; // Better default threshold for balanced results
     const includePublicOnly = body.include_public_only || false;
 
     // Always pass the user ID as p_user_id to include private docs for the user
     const p_user_id = user?.id || null;
 
-    // Helper function to execute semantic search
-    async function executeSemanticSearch(params: any, supabase: any) {
+    // Helper function to time semantic search
+    async function executeTimedSemanticSearch(params: any, supabase: any) {
+      const startTime = Date.now();
       const { data, error } = await supabase.rpc('search_document_chunks_semantic', params);
+      const duration = Date.now() - startTime;
       if (error) {
         console.error('[query-knowledge-base] Semantic search failed:', error);
-        return { data: [], error };
+        return { data: [], duration, error };
       }
-      return { data, error: null };
+      return { data, duration, error: null };
     }
 
-    // Helper function to execute keyword search
-    async function executeKeywordSearch(params: any, supabase: any) {
+    // Helper function to time keyword search
+    async function executeTimedKeywordSearch(params: any, supabase: any) {
+      const startTime = Date.now();
       const { data, error } = await supabase.rpc('search_document_chunks_keyword', params);
+      const duration = Date.now() - startTime;
       if (error) {
         console.error('[query-knowledge-base] Keyword search failed:', error);
-        return { data: [], error };
+        return { data: [], duration, error };
       }
-      return { data, error: null };
+      return { data, duration, error: null };
     }
 
-    // Call both specialized search functions IN PARALLEL
+    // Call both specialized search functions IN PARALLEL with independent timing
+    const parallelSearchStartTime = Date.now();
+    
     const [semanticResult, keywordResult] = await Promise.all([
-      executeSemanticSearch({
+      executeTimedSemanticSearch({
         query_embedding: queryEmbedding,
         similarity_threshold: minSimilarity,
         max_results: limit,
         p_user_id, // Always pass the user ID
         include_public_only: includePublicOnly
       }, supabase),
-      executeKeywordSearch({
+      executeTimedKeywordSearch({
         query_text: body.user_query,
         max_results: limit,
         p_user_id, // Always pass the user ID
         include_public_only: includePublicOnly
       }, supabase)
     ]);
+    
+    const parallelSearchEndTime = Date.now();
+    
+    // Now we have ACCURATE, INDEPENDENT timings
+    performanceMetrics.semantic_search_ms = semanticResult.duration;
+    performanceMetrics.keyword_search_ms = keywordResult.duration;
+    performanceMetrics.parallel_retrieval_ms = parallelSearchEndTime - parallelSearchStartTime;
+    
+    // Extract the response data
+    const semanticResponse = { data: semanticResult.data, error: semanticResult.error };
+    const keywordResponse = { data: keywordResult.data, error: keywordResult.error };
 
     // Check for errors in either search
-    if (semanticResult.error) {
-      console.error('[query-knowledge-base] Semantic search failed:', semanticResult.error);
+    if (semanticResponse.error) {
+      console.error('[query-knowledge-base] Semantic search failed:', semanticResponse.error);
       return new Response(
         JSON.stringify({ 
           error: 'Semantic search failed',
-          details: semanticResult.error.message 
+          details: semanticResponse.error.message 
         }), 
         {
           status: 500,
@@ -194,12 +225,12 @@ Deno.serve(async (req: Request) => {
       );
     }
 
-    if (keywordResult.error) {
-      console.error('[query-knowledge-base] Keyword search failed:', keywordResult.error);
+    if (keywordResponse.error) {
+      console.error('[query-knowledge-base] Keyword search failed:', keywordResponse.error);
       return new Response(
         JSON.stringify({ 
           error: 'Keyword search failed',
-          details: keywordResult.error.message 
+          details: keywordResponse.error.message 
         }), 
         {
           status: 500,
@@ -209,8 +240,11 @@ Deno.serve(async (req: Request) => {
     }
 
     // FUSE the two result sets using Reciprocal Rank Fusion (RRF)
-    const semanticResults = semanticResult.data || [];
-    const keywordResults = keywordResult.data || [];
+    const semanticResults = semanticResponse.data || [];
+    const keywordResults = keywordResponse.data || [];
+    
+    // Time the RRF fusion process
+    const rrfStartTime = Date.now();
     
     // Create a map to track combined scores and deduplicate results
     const resultMap = new Map();
@@ -218,11 +252,15 @@ Deno.serve(async (req: Request) => {
     // Process semantic results (similarity_score)
     semanticResults.forEach((result: any, index: number) => {
       const rrfScore = 1 / (60 + index); // RRF formula with k=60 (initial value)
+      console.log(`[query-knowledge-base] Semantic result ${index + 1}: RRF = ${rrfScore}, similarity = ${result.similarity_score}`);
       resultMap.set(result.id, {
         ...result,
         similarity: result.similarity_score,
         rrf_score: rrfScore,
-        search_type: 'semantic'
+        semantic_rank: index + 1,
+        search_type: 'semantic',
+        raw_semantic_score: result.similarity_score, // Preserve raw semantic score
+        keyword_rank: null // No keyword rank for semantic-only results
       });
     });
     
@@ -233,14 +271,20 @@ Deno.serve(async (req: Request) => {
         // Combine scores for existing results
         const existing = resultMap.get(result.id);
         existing.rrf_score += rrfScore;
+        existing.keyword_match = true;
+        existing.keyword_rank = index + 1;
         existing.search_type = 'hybrid';
+        // Keep existing raw_semantic_score, add keyword rank
       } else {
         // Add new keyword-only results
         resultMap.set(result.id, {
           ...result,
           similarity: result.relevance_score,
           rrf_score: rrfScore,
-          search_type: 'keyword'
+          keyword_match: true,
+          keyword_rank: index + 1,
+          search_type: 'keyword',
+          raw_semantic_score: null, // No semantic score for keyword-only results
         });
       }
     });
@@ -249,7 +293,14 @@ Deno.serve(async (req: Request) => {
     const searchResults = Array.from(resultMap.values())
       .sort((a, b) => b.rrf_score - a.rrf_score);
 
+    const rrfEndTime = Date.now();
+    performanceMetrics.rrf_fusion_ms = rrfEndTime - rrfStartTime;
+
     console.log(`[query-knowledge-base] Hybrid search results: ${searchResults.length} chunks (${semanticResults.length} semantic + ${keywordResults.length} keyword)`);
+    console.log(`[query-knowledge-base] Semantic results sample:`, semanticResults.slice(0, 2));
+    console.log(`[query-knowledge-base] Keyword results sample:`, keywordResults.slice(0, 2));
+
+    console.log(`[query-knowledge-base] Search results:`, searchResults ? searchResults.length : 0);
 
     // Apply additional filters
     let filteredResults = searchResults || [];
@@ -286,7 +337,8 @@ Deno.serve(async (req: Request) => {
       }
     }
 
-    // Group results by document with sophisticated metadata handling
+    // Group results by document
+    const documentGroupingStartTime = Date.now();
     const documentMap = new Map();
     
     filteredResults.forEach(result => {
@@ -298,8 +350,6 @@ Deno.serve(async (req: Request) => {
           chunks: [],
           best_rrf_score: 0, // Highest RRF score from any chunk (for sorting)
           best_raw_similarity: 0, // Highest raw semantic score (for LLM baseline)
-          rrf_score: 0, // Document-level RRF score for sorting
-          similarity_score: 0 // Document-level similarity score
         });
       }
       
@@ -312,23 +362,23 @@ Deno.serve(async (req: Request) => {
         order: result.chunk_order,
         metadata: result.metadata,
         similarity: result.rrf_score, // Keep raw RRF score (0.0-1.0)
-        raw_semantic_score: result.similarity_score, // Preserve raw semantic score
+        raw_semantic_score: result.raw_semantic_score, // Preserve raw semantic score
         keyword_rank: result.keyword_rank, // Preserve keyword rank
-        search_type: result.search_type // Track search type for debugging
+        total_chunk_count: result.total_chunk_count // Include total chunk count for density calculation
       };
       
       docEntry.chunks.push(chunkObj);
       
       // Track best RRF score for document-level ranking (for sorting)
       if (result.rrf_score > docEntry.best_rrf_score) {
+        console.log(`[query-knowledge-base] Updating document RRF: ${docEntry.best_rrf_score} -> ${result.rrf_score} for doc ${result.document_title}`);
         docEntry.best_rrf_score = result.rrf_score;
-        docEntry.rrf_score = result.rrf_score; // Use best RRF as document score
       }
       
       // Track best raw semantic score for LLM baseline (for confidence generation)
-      if (result.similarity_score && result.similarity_score > docEntry.best_raw_similarity) {
-        docEntry.best_raw_similarity = result.similarity_score;
-        docEntry.similarity_score = result.similarity_score; // Use best similarity as document score
+      if (result.raw_semantic_score && result.raw_semantic_score > docEntry.best_raw_similarity) {
+        console.log(`[query-knowledge-base] Updating document raw similarity: ${docEntry.best_raw_similarity} -> ${result.raw_semantic_score} for doc ${result.document_title}`);
+        docEntry.best_raw_similarity = result.raw_semantic_score;
       }
     });
     
@@ -336,7 +386,22 @@ Deno.serve(async (req: Request) => {
     const groupedResults = Array.from(documentMap.values())
       .sort((a, b) => b.best_rrf_score - a.best_rrf_score);
 
+    const documentGroupingEndTime = Date.now();
+    performanceMetrics.document_grouping_ms = documentGroupingEndTime - documentGroupingStartTime;
+    
+    // Calculate total search time as sum of all components
+    performanceMetrics.total_search_ms = 
+      performanceMetrics.embedding_generation_ms +
+      performanceMetrics.parallel_retrieval_ms +
+      performanceMetrics.rrf_fusion_ms +
+      performanceMetrics.document_grouping_ms;
+
     console.log(`[query-knowledge-base] Returning ${groupedResults.length} document results with ${filteredResults.length} total chunks`);
+    console.log(`[query-knowledge-base] Performance: Embedding=${performanceMetrics.embedding_generation_ms}ms, Search=${performanceMetrics.semantic_search_ms}ms, RRF=${performanceMetrics.rrf_fusion_ms}ms, Grouping=${performanceMetrics.document_grouping_ms}ms, Total=${performanceMetrics.total_search_ms}ms`);
+    
+    // DEBUG: Log the actual data being sent to frontend
+    console.log(`[query-knowledge-base] Sample document data:`, JSON.stringify(groupedResults.slice(0, 2), null, 2));
+    console.log(`[query-knowledge-base] Sample chunk data:`, JSON.stringify(groupedResults[0]?.chunks?.slice(0, 2), null, 2));
 
     return new Response(
       JSON.stringify({
@@ -344,6 +409,7 @@ Deno.serve(async (req: Request) => {
         total_documents: groupedResults.length,
         total_chunks: filteredResults.length,
         query: body.user_query,
+        performance_metrics: performanceMetrics,
         search_metadata: {
           semantic_results: semanticResults.length,
           keyword_results: keywordResults.length,
