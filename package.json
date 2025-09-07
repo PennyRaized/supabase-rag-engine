@@ -6,11 +6,13 @@
   "scripts": {
     "bootstrap": "psql $DATABASE_URL -f supabase/bootstrap.sql",
     "test": "node scripts/test-rag-engine.cjs",
-    "test:performance": "node scripts/test-performance.cjs",
+    "test:performance": "node scripts/test-performance.cjs", 
     "test:quality": "node scripts/test-search-quality.cjs",
     "smoke-test": "npm run test && echo '✅ All tests passed - RAG Engine is ready!'",
     "deploy": "supabase functions deploy",
-    "dev": "supabase functions serve"
+    "dev": "supabase functions serve",
+    "setup": "npm install && echo '📋 Next steps:' && echo '1. Copy .env.example to .env and fill in your values' && echo '2. Run: npm run bootstrap' && echo '3. Run: npm run deploy' && echo '4. Run: npm run smoke-test'",
+    "help": "echo 'Available commands:' && echo '  npm run setup     - Initial setup' && echo '  npm run bootstrap - Set up database' && echo '  npm run deploy    - Deploy Edge Functions' && echo '  npm run test      - Run functionality tests' && echo '  npm run smoke-test - Run all tests' && echo '  npm run dev       - Start local development'"
   },
   "keywords": [
     "rag",
@@ -21,7 +23,10 @@
     "llm",
     "openai",
     "supabase",
-    "pgvector"
+    "pgvector",
+    "production-ready",
+    "ai-insights",
+    "document-analysis"
   ],
   "author": "RAG Insights Engine Team",
   "license": "MIT",
@@ -36,10 +41,10 @@
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/your-org/rag-insights-engine.git"
+    "url": "https://github.com/PennyRaized/rag-insights-engine.git"
   },
   "bugs": {
-    "url": "https://github.com/your-org/rag-insights-engine/issues"
+    "url": "https://github.com/PennyRaized/rag-insights-engine/issues"
   },
-  "homepage": "https://github.com/your-org/rag-insights-engine#readme"
+  "homepage": "https://github.com/PennyRaized/rag-insights-engine#readme"
 }
