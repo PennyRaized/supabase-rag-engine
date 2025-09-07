@@ -26,11 +26,10 @@ interface SearchRequest {
   limit?: number;
   min_similarity?: number;
   include_public_only?: boolean;
+  debug?: boolean; // Add debug flag for detailed scoring
 }
 
 Deno.serve(async (req: Request) => {
-  const startTime = Date.now();
-  
   // Handle CORS preflight
   if (req.method === 'OPTIONS') {
     return new Response('ok', { headers: corsHeaders });
@@ -251,7 +250,7 @@ Deno.serve(async (req: Request) => {
     
     // Process semantic results (similarity_score)
     semanticResults.forEach((result: any, index: number) => {
-      const rrfScore = 1 / (60 + index); // RRF formula with k=60 (initial value)
+      const rrfScore = 1 / (10 + index); // RRF formula - improved k=10 for better differentiation
       console.log(`[query-knowledge-base] Semantic result ${index + 1}: RRF = ${rrfScore}, similarity = ${result.similarity_score}`);
       resultMap.set(result.id, {
         ...result,
@@ -266,7 +265,7 @@ Deno.serve(async (req: Request) => {
     
     // Process keyword results (relevance_score)
     keywordResults.forEach((result: any, index: number) => {
-      const rrfScore = 1 / (60 + index); // RRF formula with k=60 (initial value)
+      const rrfScore = 1 / (10 + index); // RRF formula - improved k=10 for better differentiation
       if (resultMap.has(result.id)) {
         // Combine scores for existing results
         const existing = resultMap.get(result.id);
@@ -304,6 +303,8 @@ Deno.serve(async (req: Request) => {
 
     // Apply additional filters
     let filteredResults = searchResults || [];
+    let fallbackUsed = false;
+    let fallbackResults: any[] = [];
     
     if (body.filters && typeof body.filters === 'object') {
       // Filter by document_id (primary for document RAG)
@@ -337,11 +338,102 @@ Deno.serve(async (req: Request) => {
       }
     }
 
+    // PHASE 1: Simple Fallback Strategy
+    // If precision pass returns too few results, try broader search
+    const MIN_RESULTS_THRESHOLD = 3; // Trigger fallback if less than 3 results
+    
+    if (filteredResults.length < MIN_RESULTS_THRESHOLD && !fallbackUsed) {
+      console.log(`[query-knowledge-base] Precision pass returned ${filteredResults.length} results (below threshold ${MIN_RESULTS_THRESHOLD}), trying broader search...`);
+      
+      try {
+        // Broader search: remove restrictive filters but keep user permissions
+        const broaderSearchResults = await Promise.all([
+          supabase.rpc('search_document_chunks_semantic', {
+            query_embedding: queryEmbedding,
+            similarity_threshold: Math.max(0.3, minSimilarity - 0.2), // Lower threshold for broader results
+            max_results: limit * 2, // Get more results for broader search
+            p_user_id, // Keep user permissions
+            include_public_only: includePublicOnly
+          }),
+          supabase.rpc('search_document_chunks_keyword', {
+            query_text: body.user_query,
+            max_results: limit * 2, // Get more results for broader search
+            p_user_id, // Keep user permissions
+            include_public_only: includePublicOnly
+          })
+        ]);
+
+        if (!broaderSearchResults[0].error && !broaderSearchResults[1].error) {
+          // Process broader results with RRF
+          const broaderSemantic = broaderSearchResults[0].data || [];
+          const broaderKeyword = broaderSearchResults[1].data || [];
+          
+          // Create broader result map
+          const broaderResultMap = new Map();
+          
+          broaderSemantic.forEach((result: any, index: number) => {
+            const rrfScore = 1 / (10 + index); // RRF formula - improved k=10 for better differentiation
+            broaderResultMap.set(result.id, {
+              ...result,
+              similarity: result.similarity_score,
+              rrf_score: rrfScore,
+              semantic_rank: index + 1,
+              search_type: 'semantic_fallback',
+              raw_semantic_score: result.similarity_score, // Preserve raw semantic score
+              keyword_rank: null // No keyword rank for semantic-only results
+            });
+          });
+          
+          broaderKeyword.forEach((result: any, index: number) => {
+            const rrfScore = 1 / (10 + index); // RRF formula - improved k=10 for better differentiation
+            if (broaderResultMap.has(result.id)) {
+              const existing = broaderResultMap.get(result.id);
+              existing.rrf_score += rrfScore;
+              existing.keyword_match = true;
+              existing.keyword_rank = index + 1;
+              existing.search_type = 'hybrid_fallback';
+            } else {
+              broaderResultMap.set(result.id, {
+                ...result,
+                similarity: result.relevance_score,
+                rrf_score: rrfScore,
+                keyword_match: true,
+                keyword_rank: index + 1,
+                search_type: 'keyword_fallback',
+                raw_semantic_score: null, // No semantic score for keyword-only results
+              });
+            }
+          });
+
+          // Convert to array and sort
+          fallbackResults = Array.from(broaderResultMap.values())
+            .sort((a, b) => b.rrf_score - a.rrf_score);
+          
+          fallbackUsed = true;
+          console.log(`[query-knowledge-base] Fallback search returned ${fallbackResults.length} additional results`);
+        }
+      } catch (fallbackError) {
+        console.error('[query-knowledge-base] Fallback search failed:', fallbackError);
+        // Continue with original results if fallback fails
+      }
+    }
+
+    // Combine original filtered results with fallback results
+    let finalResults = [...filteredResults];
+    if (fallbackUsed && fallbackResults.length > 0) {
+      // Add fallback results, avoiding duplicates
+      const existingIds = new Set(filteredResults.map(r => r.id));
+      const uniqueFallbackResults = fallbackResults.filter(r => !existingIds.has(r.id));
+      finalResults = [...filteredResults, ...uniqueFallbackResults];
+      
+      console.log(`[query-knowledge-base] Combined results: ${filteredResults.length} precision + ${uniqueFallbackResults.length} fallback = ${finalResults.length} total`);
+    }
+
     // Group results by document
     const documentGroupingStartTime = Date.now();
     const documentMap = new Map();
     
-    filteredResults.forEach(result => {
+    finalResults.forEach(result => {
       if (!documentMap.has(result.document_id)) {
         documentMap.set(result.document_id, {
           document_id: result.document_id,
@@ -350,12 +442,13 @@ Deno.serve(async (req: Request) => {
           chunks: [],
           best_rrf_score: 0, // Highest RRF score from any chunk (for sorting)
           best_raw_similarity: 0, // Highest raw semantic score (for LLM baseline)
+          relevance_density: 0 // Initialize relevance density score
         });
       }
       
       const docEntry = documentMap.get(result.document_id);
       
-      // Create chunk object with comprehensive metadata
+      // Create chunk object with debug information if requested
       const chunkObj: any = {
         id: result.id,
         text: result.chunk_text,
@@ -366,6 +459,20 @@ Deno.serve(async (req: Request) => {
         keyword_rank: result.keyword_rank, // Preserve keyword rank
         total_chunk_count: result.total_chunk_count // Include total chunk count for density calculation
       };
+      
+      // Add debug scoring information if debug mode is enabled
+      if (body.debug === true) {
+        chunkObj._debug_scores = {
+          search_type: result.search_type,
+          semantic_rank: result.semantic_rank,
+          keyword_rank: result.keyword_rank,
+          rrf_score: result.rrf_score,
+          keyword_match: result.keyword_match,
+          // Add raw scores for better understanding
+          raw_semantic_score: result.similarity_score,
+          raw_keyword_score: result.relevance_score
+        };
+      }
       
       docEntry.chunks.push(chunkObj);
       
@@ -381,6 +488,32 @@ Deno.serve(async (req: Request) => {
         docEntry.best_raw_similarity = result.raw_semantic_score;
       }
     });
+    
+          // Calculate relevance density for each document
+      documentMap.forEach((docEntry) => {
+        // Get the number of chunks returned by the search for this document
+        const matchedChunks = docEntry.chunks.length;
+
+        if (matchedChunks === 0) {
+          docEntry.relevance_density = 0;
+          return;
+        }
+
+        // Get the TRUE total number of chunks for this document from our new DB field.
+        // We only need to get it from the first chunk, as it's the same for all.
+        // The ?. is a safeguard in case total_chunk_count isn't present.
+        const totalChunksInDocument = docEntry.chunks[0]?.total_chunk_count || matchedChunks;
+        
+        // THE CORRECT CALCULATION:
+        // (Number of Matched Chunks) / (Total Chunks in the Document)
+        if (totalChunksInDocument > 0) {
+            docEntry.relevance_density = matchedChunks / totalChunksInDocument;
+        } else {
+            docEntry.relevance_density = 0;
+        }
+
+        console.log(`[query-knowledge-base] Document "${docEntry.document_title}": Found ${matchedChunks} relevant chunks out of ${totalChunksInDocument} total. Density: ${(docEntry.relevance_density * 100).toFixed(0)}%`);
+      });
     
     // Convert map to array and sort by best RRF score
     const groupedResults = Array.from(documentMap.values())
@@ -407,14 +540,17 @@ Deno.serve(async (req: Request) => {
       JSON.stringify({
         results: groupedResults,
         total_documents: groupedResults.length,
-        total_chunks: filteredResults.length,
+        total_chunks: finalResults.length,
         query: body.user_query,
         performance_metrics: performanceMetrics,
-        search_metadata: {
-          semantic_results: semanticResults.length,
-          keyword_results: keywordResults.length,
-          hybrid_results: searchResults.length,
-          filtered_results: filteredResults.length
+        fallback_info: fallbackUsed ? {
+          used: true,
+          precision_results: filteredResults.length,
+          fallback_results: fallbackResults.length,
+          total_combined: finalResults.length,
+          threshold: MIN_RESULTS_THRESHOLD
+        } : {
+          used: false
         }
       }),
       {

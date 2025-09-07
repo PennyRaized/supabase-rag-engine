@@ -141,6 +141,15 @@ async function generateDocumentSummaries(
         .map((c: any) => c.text)
         .join('\n\n');
 
+      // Use RRF score and relevance density for confidence scoring
+      const rrfScore = doc.rrf_score || 0.5; // Default to 0.5 if no RRF score
+      const rrfPercentage = Math.round(rrfScore * 100);
+      const relevanceDensity = doc.relevance_density || 0; // Default to 0 if no density
+      const densityPercentage = Math.round(relevanceDensity * 100);
+      
+      // Log the scores for debugging
+      console.log(`[generateDocumentSummaries] Document "${doc.document_title}" has RRF score: ${rrfScore} (${rrfPercentage}%), Relevance Density: ${relevanceDensity.toFixed(2)} (${densityPercentage}%)`);
+      
       const prompt = `You are an expert research analyst. Your task is to read the provided document excerpts and extract the single most important and compelling insight, conclusion, or key data point that is relevant to the user's original query.
 
 ---
@@ -152,26 +161,44 @@ DOCUMENT EXCERPTS:
 ${context}
 
 ---
+SEARCH RELEVANCE SCORES:
+- RRF Score: ${rrfPercentage}% (how well the document matches the search query)
+- Relevance Density: ${densityPercentage}% (percentage of chunks that are highly relevant to the topic)
+
+RELEVANCE DENSITY INTERPRETATION:
+- High density (70%+): Document is primarily ABOUT this topic
+- Medium density (30-70%): Document discusses this topic as a significant part
+- Low density (0-30%): Document only MENTIONS this topic in passing
+
+---
 INSTRUCTIONS:
 1. Generate a single, concise sentence that directly addresses the user's query.
 2. Start directly with the key finding. Be impactful.
 3. Do NOT use meta-commentary like "This document discusses..." or "This chunk is relevant because...".
 4. Do NOT repeat the user's query.
-5. Base your confidence on how well the document content addresses the query.
+5. CRITICAL: Use both RRF score (${rrfPercentage}%) and Relevance Density (${densityPercentage}%) to determine confidence.
 
 CONFIDENCE SCORING GUIDELINES:
-- High relevance: Document directly addresses the query (0.8-0.95)
-- Medium relevance: Document partially addresses the query (0.5-0.8)
-- Low relevance: Document only mentions the topic (0.2-0.5)
-- Very low relevance: Document barely related (0.1-0.3)
+- Base your confidence on BOTH RRF score (${rrfPercentage}%) AND Relevance Density (${densityPercentage}%)
+- High density + high RRF = very high confidence (0.8-0.95)
+- High density + low RRF = medium-high confidence (0.6-0.8)
+- Low density + high RRF = medium confidence (0.4-0.6)
+- Low density + low RRF = low confidence (0.1-0.4)
+- Final confidence should be between 0.1 and 0.95
+
+EXAMPLE:
+User Query: "small language models for edge devices"
+Document with RRF 90% + Density 85%: "Small Language Models (SLMs) are optimized for edge deployment..." → confidence_score: 0.90-0.95
+Document with RRF 90% + Density 20%: "The AI market includes various models, with some small language models..." → confidence_score: 0.50-0.70
+Document with RRF 30% + Density 10%: "The conversational AI market is growing rapidly..." → confidence_score: 0.15-0.35
 
 JSON OUTPUT EXAMPLE:
 {
   "relevance_summary": "Small Language Models (SLMs) are optimized for edge deployment with reduced computational requirements, achieving 90% accuracy while using 10x less memory than traditional models.",
-  "confidence_score": 0.85
+  "confidence_score": 0.90
 }
 
-IMPORTANT: Your confidence score should reflect how well the document content addresses the user's query.`;
+IMPORTANT: Your confidence score should reflect BOTH the RRF score (${rrfPercentage}%) AND the Relevance Density (${densityPercentage}%) to distinguish between documents that are ABOUT the topic vs just MENTION it.`;
 
       const messages = [{ role: 'user', content: prompt }];
       const llmResponse = await getOpenAIChatCompletion(messages, 'gpt-4o-mini', 0.2, priority);
